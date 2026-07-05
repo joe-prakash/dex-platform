@@ -1,0 +1,31 @@
+services:
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:24
+    container_name: clickhouse
+    ports:
+      - "8123:8123"
+      - "9000:9000"
+    volumes:
+      - clickhouse_data:/var/lib/clickhouse
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: grafana
+    ports:
+      - "3000:3000"
+    volumes:
+      - grafana_data:/var/lib/grafana
+    restart: unless-stopped
+
+  api:
+    build: ./api
+    container_name: dex-api
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
+
+volumes:
+  clickhouse_data:
+  grafana_data:

@@ -6,6 +6,9 @@ venv/
 
 *.log
 *.err.txt
+*.bak
 python-version-check.txt
 agent-deps-check.txt
+
+agent/state/
 

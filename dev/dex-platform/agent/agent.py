@@ -5,8 +5,30 @@ import platform
 import time
 import getpass
 import win32evtlog
+import json
+import logging
+from pathlib import Path
 
 API_URL = "http://localhost:8000"
+BASE_DIR = Path(__file__).resolve().parent
+STATE_DIR = BASE_DIR / "state"
+EVENT_CHECKPOINT_FILE = STATE_DIR / "eventlog_checkpoints.json"
+EVENT_LOG_TYPES = ["System", "Application"]
+INITIAL_EVENT_BACKFILL = 20
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s"
+)
+
+EVENT_LEVELS = {
+    0: "Critical",
+    1: "Error",
+    2: "Warning",
+    4: "Information",
+    8: "Audit Success",
+    16: "Audit Failure",
+}
 
 
 # ---------------------------------------------------
@@ -57,11 +79,13 @@ try:
         timeout=10
     )
 
-    print("Device Registered:", response.json())
+    response.raise_for_status()
+
+    logging.info("Device registered: %s", response.json())
 
 except Exception as e:
 
-    print("Registration Error:", e)
+    logging.error("Registration error: %s", e)
 
 
 # ---------------------------------------------------
@@ -100,86 +124,150 @@ def collect_processes():
                 "status": proc.info['status']
             })
 
-        except:
-            pass
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess) as e:
+            logging.debug("Skipped process during collection: %s", e)
 
     return process_list
+
+
+def load_event_checkpoints():
+
+    if not EVENT_CHECKPOINT_FILE.exists():
+        return {}
+
+    try:
+        with EVENT_CHECKPOINT_FILE.open("r", encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError) as e:
+        logging.error("Could not read event checkpoint file: %s", e)
+        return {}
+
+
+def save_event_checkpoints(checkpoints):
+
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    temp_file = EVENT_CHECKPOINT_FILE.with_suffix(".tmp")
+
+    with temp_file.open("w", encoding="utf-8") as f:
+        json.dump(checkpoints, f, indent=2, sort_keys=True)
+
+    temp_file.replace(EVENT_CHECKPOINT_FILE)
+
+
+def event_time_to_text(event_time):
+
+    if hasattr(event_time, "Format"):
+        return event_time.Format("%Y-%m-%dT%H:%M:%S")
+
+    return str(event_time)
+
+
+def event_level_name(event_type):
+
+    return EVENT_LEVELS.get(int(event_type), f"Unknown({event_type})")
+
+
+def event_to_payload(event, log_type):
+
+    message = ""
+
+    if event.StringInserts:
+        message = " ".join([str(x) for x in event.StringInserts])
+
+    return {
+        "timestamp": event_time_to_text(event.TimeGenerated),
+        "hostname": hostname,
+        "log_type": log_type,
+        "record_number": int(event.RecordNumber),
+        "source": str(event.SourceName),
+        "event_id": int(event.EventID & 0xFFFF),
+        "level": event_level_name(event.EventType),
+        "message": message[:1000]
+    }
 
 
 # ---------------------------------------------------
 # EVENT LOG COLLECTION
 # ---------------------------------------------------
 
-def collect_event_logs():
+def collect_event_logs(checkpoints):
 
     events = []
+    next_checkpoints = checkpoints.copy()
 
     server = 'localhost'
 
-    log_types = ['System', 'Application']
-
-    for log_type in log_types:
+    for log_type in EVENT_LOG_TYPES:
 
         try:
 
             hand = win32evtlog.OpenEventLog(server, log_type)
+            oldest_record = win32evtlog.GetOldestEventLogRecord(hand)
+            record_count = win32evtlog.GetNumberOfEventLogRecords(hand)
+            newest_record = oldest_record + record_count - 1
+
+            last_record = int(checkpoints.get(log_type, 0))
+
+            if record_count == 0:
+                next_checkpoints[log_type] = last_record
+                win32evtlog.CloseEventLog(hand)
+                continue
+
+            if last_record < oldest_record - 1 or last_record > newest_record:
+                logging.warning(
+                    "%s event log checkpoint reset because of rollover or clear. checkpoint=%s oldest=%s newest=%s",
+                    log_type,
+                    last_record,
+                    oldest_record,
+                    newest_record
+                )
+                last_record = max(oldest_record - 1, newest_record - INITIAL_EVENT_BACKFILL)
+
+            if last_record == 0:
+                last_record = max(oldest_record - 1, newest_record - INITIAL_EVENT_BACKFILL)
 
             flags = (
-                win32evtlog.EVENTLOG_BACKWARDS_READ |
-                win32evtlog.EVENTLOG_SEQUENTIAL_READ
+                win32evtlog.EVENTLOG_FORWARDS_READ |
+                win32evtlog.EVENTLOG_SEEK_READ
             )
 
-            records = win32evtlog.ReadEventLog(
-                hand,
-                flags,
-                0
-            )
+            offset = last_record + 1
+            max_record_seen = last_record
 
-            for event in records[:20]:
+            while offset <= newest_record:
 
-                try:
+                records = win32evtlog.ReadEventLog(
+                    hand,
+                    flags,
+                    offset
+                )
 
-                    level = str(event.EventType)
+                if not records:
+                    break
 
-                    source = str(event.SourceName)
+                for event in records:
 
-                    event_id = int(event.EventID & 0xFFFF)
+                    if int(event.RecordNumber) <= last_record:
+                        continue
 
-                    message = ""
+                    events.append(event_to_payload(event, log_type))
+                    max_record_seen = max(max_record_seen, int(event.RecordNumber))
+                    offset = int(event.RecordNumber) + 1
 
-                    if event.StringInserts:
+            next_checkpoints[log_type] = max_record_seen
+            win32evtlog.CloseEventLog(hand)
 
-                        message = " ".join(
-                            [str(x) for x in event.StringInserts]
-                        )
+        except Exception as e:
+            logging.error("Event log collection error for %s: %s", log_type, e)
 
-                    events.append({
-
-                        "hostname": hostname,
-
-                        "log_type": log_type,
-
-                        "source": source,
-
-                        "event_id": event_id,
-
-                        "level": level,
-
-                        "message": message[:1000]
-                    })
-
-                except:
-                    pass
-
-        except:
-            pass
-
-    return events
+    return events, next_checkpoints
 
 
 # ---------------------------------------------------
 # MAIN LOOP
 # ---------------------------------------------------
+
+event_checkpoints = load_event_checkpoints()
 
 while True:
 
@@ -208,11 +296,13 @@ while True:
             timeout=10
         )
 
-        print("Telemetry Sent:", response.json())
+        response.raise_for_status()
+
+        logging.info("Telemetry sent: %s", response.json())
 
     except Exception as e:
 
-        print("Telemetry Error:", e)
+        logging.error("Telemetry error: %s", e)
 
     # ---------------------------------------------------
     # PROCESS METRICS
@@ -228,11 +318,13 @@ while True:
             timeout=30
         )
 
-        print("Processes Sent:", response.json())
+        response.raise_for_status()
+
+        logging.info("Processes sent: %s", response.json())
 
     except Exception as e:
 
-        print("Process Error:", e)
+        logging.error("Process error: %s", e)
 
     # ---------------------------------------------------
     # EVENT LOGS
@@ -240,18 +332,30 @@ while True:
 
     try:
 
-        event_logs = collect_event_logs()
+        event_logs, next_event_checkpoints = collect_event_logs(event_checkpoints)
 
-        response = requests.post(
-            f"{API_URL}/eventlogs",
-            json=event_logs,
-            timeout=30
-        )
+        if event_logs:
 
-        print("Event Logs Sent:", response.json())
+            response = requests.post(
+                f"{API_URL}/eventlogs",
+                json=event_logs,
+                timeout=30
+            )
+
+            response.raise_for_status()
+            save_event_checkpoints(next_event_checkpoints)
+            event_checkpoints = next_event_checkpoints
+
+            logging.info("Event logs sent: %s", response.json())
+
+        else:
+
+            save_event_checkpoints(next_event_checkpoints)
+            event_checkpoints = next_event_checkpoints
+            logging.info("No new event logs to send")
 
     except Exception as e:
 
-        print("Event Log Error:", e)
+        logging.error("Event log error: %s", e)
 
     time.sleep(30)

@@ -67,8 +67,10 @@ class ProcessMetric(BaseModel):
 
 class EventLog(BaseModel):
 
+    timestamp: datetime | None = None
     hostname: str
     log_type: str
+    record_number: int | None = None
     source: str
     event_id: int
     level: str
@@ -220,9 +222,11 @@ def eventlogs(events: list[EventLog]):
     for e in events:
 
         rows.append([
+            e.timestamp or datetime.now(),
             datetime.now(),
             e.hostname,
             e.log_type,
+            e.record_number or 0,
             e.source,
             e.event_id,
             e.level,
@@ -234,8 +238,10 @@ def eventlogs(events: list[EventLog]):
         rows,
         column_names=[
             "timestamp",
+            "collected_at",
             "hostname",
             "log_type",
+            "record_number",
             "source",
             "event_id",
             "level",
